@@ -1,13 +1,17 @@
-
 import asyncio
 import html
 import json
+import logging
 import random
+import re
 import os
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from typing import Dict, List
 import uvicorn
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("trzni_arena")
 
 app = FastAPI(title="Tržní Aréna v2 - Multi-room")
 
@@ -19,8 +23,11 @@ def sanitize_name(name: str) -> str:
     """Sanitize player name to prevent XSS and enforce length limits."""
     if not name:
         return "Anonym"
-    sanitized = html.escape(name.strip())
-    return sanitized[:MAX_PLAYER_NAME_LENGTH]
+    # Remove characters that are unsafe for URL paths (keep letters, digits, spaces, hyphens, underscores)
+    name = re.sub(r'[^A-Za-z0-9 _-]', '', name)
+    name = name.strip()[:MAX_PLAYER_NAME_LENGTH]
+    sanitized = html.escape(name)
+    return sanitized if sanitized else "Anonym"
 
 def validate_room_id(room_id: str) -> bool:
     """Validate room ID format."""
@@ -29,10 +36,17 @@ def validate_room_id(room_id: str) -> bool:
     allowed_chars = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.")
     return all(c in allowed_chars for c in room_id)
 
+async def send_error(ws: WebSocket, msg: str):
+    try:
+        await ws.send_json({"type": "error", "msg": msg})
+    except Exception:
+        pass
+
 # ============ GAME STATE PER ROOM ============
 class GameState:
     def __init__(self, room_id: str):
         self.room_id = room_id
+        self.lock = asyncio.Lock()
         self.reset()
 
     def reset(self):
@@ -50,20 +64,22 @@ class GameState:
         self.round_history = []
         self.equilibrium_price = 0
         self.equilibrium_qty = 0
+        self.lock = asyncio.Lock()
 
-    def add_player(self, name: str) -> dict:
-        if name in self.players:
-            return self.players[name]
-        role = "buyer" if len(self.players) % 2 == 0 else "seller"
-        if role == "buyer":
-            wtp = random.randint(30, 100)
-            player = {"name": name, "role": role, "wtp": wtp, "mc": None, "profit": 0, "traded_this_round": False}
-        else:
-            mc = random.randint(10, 70)
-            player = {"name": name, "role": role, "wtp": None, "mc": mc, "profit": 0, "traded_this_round": False}
-        self.players[name] = player
-        self._calc_equilibrium()
-        return player
+    async def add_player(self, name: str) -> dict:
+        async with self.lock:
+            if name in self.players:
+                return self.players[name]
+            role = "buyer" if len(self.players) % 2 == 0 else "seller"
+            if role == "buyer":
+                wtp = random.randint(30, 100)
+                player = {"name": name, "role": role, "wtp": wtp, "mc": None, "profit": 0, "traded_this_round": False}
+            else:
+                mc = random.randint(10, 70)
+                player = {"name": name, "role": role, "wtp": None, "mc": mc, "profit": 0, "traded_this_round": False}
+            self.players[name] = player
+            self._calc_equilibrium()
+            return player
 
     def _calc_equilibrium(self):
         self.equilibrium_price = 0
@@ -77,65 +93,72 @@ class GameState:
             else:
                 break
 
-    def start_round(self):
-        self.round += 1
-        self.phase = "trading"
-        self.round_trades = []
-        self.offers = []
-        self.bids = []
-        for p in self.players.values():
-            p["traded_this_round"] = False
+    async def start_round(self):
+        async with self.lock:
+            if self.round >= self.max_rounds:
+                return
+            self.round += 1
+            self.phase = "trading"
+            self.round_trades = []
+            self.offers = []
+            self.bids = []
+            for p in self.players.values():
+                p["traded_this_round"] = False
 
-    def try_match(self):
-        matched = []
-        self.bids.sort(key=lambda x: x["price"], reverse=True)
-        self.offers.sort(key=lambda x: x["price"])
-        for bid in self.bids:
-            if bid["matched"]:
-                continue
-            buyer = self.players.get(bid["player"])
-            if buyer is None or buyer.get("traded_this_round"):
-                continue
-            for offer in self.offers:
-                if offer["matched"]:
+    async def try_match(self):
+        async with self.lock:
+            matched = []
+            self.bids.sort(key=lambda x: x["price"], reverse=True)
+            self.offers.sort(key=lambda x: x["price"])
+            for bid in self.bids:
+                if bid["matched"]:
                     continue
-                seller = self.players.get(offer["player"])
-                if seller is None or seller.get("traded_this_round"):
+                buyer = self.players.get(bid["player"])
+                if buyer is None or buyer.get("traded_this_round"):
                     continue
-                effective_price = offer["price"] + self.tax
-                if bid["price"] >= effective_price and offer["price"] >= self.price_floor and bid["price"] <= self.price_ceiling:
-                    trade_price = (bid["price"] + offer["price"]) / 2
-                    if trade_price < self.price_floor or trade_price > self.price_ceiling:
+                for offer in self.offers:
+                    if offer["matched"]:
                         continue
-                    bid["matched"] = True
-                    offer["matched"] = True
-                    buyer = self.players[bid["player"]]
-                    seller = self.players[offer["player"]]
-                    buyer_profit = buyer["wtp"] - trade_price - (self.tax / 2)
-                    seller_profit = trade_price - seller["mc"] - (self.tax / 2)
-                    buyer["profit"] += round(buyer_profit, 1)
-                    seller["profit"] += round(seller_profit, 1)
-                    buyer["traded_this_round"] = True
-                    seller["traded_this_round"] = True
-                    trade = {"buyer": bid["player"], "seller": offer["player"], "price": round(trade_price, 1), "round": self.round}
-                    self.trades.append(trade)
-                    self.round_trades.append(trade)
-                    matched.append(trade)
-        return matched
+                    seller = self.players.get(offer["player"])
+                    if seller is None or seller.get("traded_this_round"):
+                        continue
+                    effective_price = offer["price"] + self.tax
+                    if bid["price"] >= effective_price and offer["price"] >= self.price_floor and bid["price"] <= self.price_ceiling:
+                        trade_price = (bid["price"] + offer["price"]) / 2
+                        if trade_price < self.price_floor or trade_price > self.price_ceiling:
+                            continue
+                        bid["matched"] = True
+                        offer["matched"] = True
+                        buyer = self.players[bid["player"]]
+                        seller = self.players[offer["player"]]
+                        buyer_profit = buyer["wtp"] - trade_price - (self.tax / 2)
+                        seller_profit = trade_price - seller["mc"] - (self.tax / 2)
+                        buyer["profit"] += round(buyer_profit, 1)
+                        seller["profit"] += round(seller_profit, 1)
+                        buyer["traded_this_round"] = True
+                        seller["traded_this_round"] = True
+                        trade = {"buyer": bid["player"], "seller": offer["player"], "price": round(trade_price, 1), "round": self.round}
+                        self.trades.append(trade)
+                        self.round_trades.append(trade)
+                        matched.append(trade)
+            return matched
 
-    def end_round(self):
-        self.phase = "results"
-        prices = [t["price"] for t in self.round_trades]
-        self.round_history.append({
-            "round": self.round,
-            "trades": len(self.round_trades),
-            "avg_price": round(sum(prices)/len(prices), 1) if prices else 0,
-            "eq_price": round(self.equilibrium_price, 1),
-            "eq_qty": self.equilibrium_qty,
-            "tax": self.tax,
-            "floor": self.price_floor,
-            "ceiling": self.price_ceiling
-        })
+    async def end_round(self):
+        async with self.lock:
+            if self.phase != "trading":
+                return
+            self.phase = "results"
+            prices = [t["price"] for t in self.round_trades]
+            self.round_history.append({
+                "round": self.round,
+                "trades": len(self.round_trades),
+                "avg_price": round(sum(prices)/len(prices), 1) if prices else 0,
+                "eq_price": round(self.equilibrium_price, 1),
+                "eq_qty": self.equilibrium_qty,
+                "tax": self.tax,
+                "floor": self.price_floor,
+                "ceiling": self.price_ceiling
+            })
 
 # Room management
 rooms: Dict[str, GameState] = {}
@@ -153,12 +176,12 @@ async def broadcast_room(room_id: str, msg: dict):
     for ws in list(room_connections.get(room_id, {}).values()):
         try:
             await ws.send_json(msg)
-        except:
+        except Exception:
             pass
     for ws in list(room_admin_connections.get(room_id, [])):
         try:
             await ws.send_json(msg)
-        except:
+        except Exception:
             pass
 
 async def broadcast_state(room_id: str):
@@ -201,53 +224,73 @@ async def player_ws(websocket: WebSocket, room_id: str, name: str):
     await websocket.accept()
     # Validate room_id
     if not validate_room_id(room_id):
-        await websocket.send_json({"type": "error", "msg": "Neplatný kód semináře!"})
+        await send_error(websocket, "Neplatný kód semináře!")
         await websocket.close()
         return
     # Sanitize player name
     name = sanitize_name(name)
     game = get_room(room_id)
-    player = game.add_player(name)
+    player = await game.add_player(name)
     # Close old connection if same player name reconnects
     if name in room_connections.get(room_id, {}):
         try:
             await room_connections[room_id][name].close()
-        except:
+        except Exception:
             pass
+    # Remove any pending bids/offers from previous connection
+    async with game.lock:
+        game.bids = [b for b in game.bids if b["player"] != name]
+        game.offers = [o for o in game.offers if o["player"] != name]
     room_connections[room_id][name] = websocket
     await websocket.send_json({"type": "welcome", "player": player, "room": room_id})
     await broadcast_state(room_id)
     try:
         while True:
-            data = json.loads(await websocket.receive_text())
-            if data["action"] == "bid" and game.phase == "trading":
-                p = game.players[name]
-                if p["traded_this_round"]:
-                    await websocket.send_json({"type": "error", "msg": "Už jsi v tomto kole obchodoval/a!"})
-                    continue
-                price = float(data["price"])
-                if price <= 0:
-                    await websocket.send_json({"type": "error", "msg": "Cena musí být kladná!"})
-                    continue
-                if p["role"] == "buyer":
-                    if price > p["wtp"]:
-                        await websocket.send_json({"type": "error", "msg": f"Nemůžeš nabídnout víc než tvá WTP ({p['wtp']})!"})
+            try:
+                data = json.loads(await websocket.receive_text())
+            except (json.JSONDecodeError, KeyError):
+                await send_error(websocket, "Neplatná zpráva.")
+                continue
+            if data.get("action") == "bid" and game.phase == "trading":
+                async with game.lock:
+                    p = game.players.get(name)
+                    if p is None:
+                        await send_error(websocket, "Hráč nenalezen.")
                         continue
-                    # Replace any previous unmatched bid from this player
-                    game.bids = [b for b in game.bids if b["player"] != name]
-                    game.bids.append({"player": name, "price": price, "matched": False})
-                else:
-                    if price < p["mc"]:
-                        await websocket.send_json({"type": "error", "msg": f"Nemůžeš prodávat pod svými MC ({p['mc']})!"})
+                    if p["traded_this_round"]:
+                        await send_error(websocket, "Už jsi v tomto kole obchodoval/a!")
                         continue
-                    # Replace any previous unmatched offer from this player
-                    game.offers = [o for o in game.offers if o["player"] != name]
-                    game.offers.append({"player": name, "price": price, "matched": False})
-                matched = game.try_match()
+                    try:
+                        price = float(data["price"])
+                    except (ValueError, TypeError):
+                        await send_error(websocket, "Cena musí být číslo!")
+                        continue
+                    if price <= 0:
+                        await send_error(websocket, "Cena musí být kladná!")
+                        continue
+                    if p["role"] == "buyer":
+                        if price > p["wtp"]:
+                            await send_error(websocket, f"Nemůžeš nabídnout víc než tvá WTP ({p['wtp']})!")
+                            continue
+                        # Replace any previous unmatched bid from this player
+                        game.bids = [b for b in game.bids if b["player"] != name]
+                        game.bids.append({"player": name, "price": price, "matched": False})
+                    else:
+                        if price < p["mc"]:
+                            await send_error(websocket, f"Nemůžeš prodávat pod svými MC ({p['mc']})!")
+                            continue
+                        # Replace any previous unmatched offer from this player
+                        game.offers = [o for o in game.offers if o["player"] != name]
+                        game.offers.append({"player": name, "price": price, "matched": False})
+                    matched = await game.try_match()
                 if matched:
                     await broadcast_room(room_id, {"type": "trade", "trades": matched})
                 await broadcast_state(room_id)
     except WebSocketDisconnect:
+        logger.info(f"Player {name} disconnected from room {room_id}")
+        async with game.lock:
+            game.bids = [b for b in game.bids if b["player"] != name]
+            game.offers = [o for o in game.offers if o["player"] != name]
         if name in room_connections.get(room_id, {}):
             del room_connections[room_id][name]
 
@@ -256,55 +299,92 @@ async def admin_ws(websocket: WebSocket, room_id: str):
     await websocket.accept()
     # Validate room_id
     if not validate_room_id(room_id):
-        await websocket.send_json({"type": "error", "msg": "Neplatný kód semináře!"})
+        await send_error(websocket, "Neplatný kód semináře!")
         await websocket.close()
         return
     game = get_room(room_id)
-    room_admin_connections.setdefault(room_id, []).append(websocket)
+    room_admin_connections[room_id].append(websocket)
     await broadcast_state(room_id)
     try:
         while True:
-            data = json.loads(await websocket.receive_text())
-            if data["action"] == "start_round":
-                game.start_round()
+            try:
+                data = json.loads(await websocket.receive_text())
+            except (json.JSONDecodeError, KeyError):
+                await send_error(websocket, "Neplatná zpráva.")
+                continue
+            action = data.get("action")
+            if action == "start_round":
+                async with game.lock:
+                    if game.round >= game.max_rounds:
+                        await send_error(websocket, "Maximální počet kol již byl dosažen.")
+                        continue
+                await game.start_round()
                 await broadcast_room(room_id, {"type": "round_start", "round": game.round})
                 await broadcast_state(room_id)
-            elif data["action"] == "end_round":
-                game.end_round()
+            elif action == "end_round":
+                await game.end_round()
                 await broadcast_room(room_id, {"type": "round_end", "round": game.round})
                 await broadcast_state(room_id)
-            elif data["action"] == "set_tax":
-                game.tax = float(data["value"])
-                game._calc_equilibrium()
+            elif action == "set_tax":
+                try:
+                    val = float(data["value"])
+                except (ValueError, TypeError):
+                    await send_error(websocket, "Daň musí být číslo.")
+                    continue
+                if val < 0:
+                    await send_error(websocket, "Daň nemůže být záporná.")
+                    continue
+                async with game.lock:
+                    game.tax = val
+                    game._calc_equilibrium()
                 await broadcast_room(room_id, {"type": "shock", "msg": f"🔔 Nová daň: {game.tax} Kč na jednotku!"})
                 await broadcast_state(room_id)
-            elif data["action"] == "set_floor":
-                val = float(data["value"])
+            elif action == "set_floor":
+                try:
+                    val = float(data["value"])
+                except (ValueError, TypeError):
+                    await send_error(websocket, "Cenová podlaha musí být číslo.")
+                    continue
                 if val < 0:
+                    await send_error(websocket, "Cenová podlaha nemůže být záporná.")
                     continue
-                if game.price_ceiling < 999 and val > game.price_ceiling:
-                    await websocket.send_json({"type": "error", "msg": f"Cenová podlaha ({val}) nemůže být vyšší než cenový strop ({game.price_ceiling})!"})
-                    continue
-                game.price_floor = val
+                async with game.lock:
+                    if game.price_ceiling < 999 and val > game.price_ceiling:
+                        await send_error(websocket, f"Cenová podlaha ({val}) nemůže být vyšší než cenový strop ({game.price_ceiling})!")
+                        continue
+                    game.price_floor = val
                 await broadcast_room(room_id, {"type": "shock", "msg": f"🔔 Cenová podlaha: {game.price_floor} Kč!"})
                 await broadcast_state(room_id)
-            elif data["action"] == "set_ceiling":
-                val = float(data["value"])
+            elif action == "set_ceiling":
+                try:
+                    val = float(data["value"])
+                except (ValueError, TypeError):
+                    await send_error(websocket, "Cenový strop musí být číslo.")
+                    continue
                 if val <= 0:
-                    game.price_ceiling = 999
-                    await broadcast_room(room_id, {"type": "shock", "msg": "🔔 Cenový strop zrušen!"})
-                else:
+                    await send_error(websocket, "Cenový strop musí být kladné číslo. Pro zrušení použijte tlačítko Zrušit strop.")
+                    continue
+                async with game.lock:
                     if game.price_floor > 0 and val < game.price_floor:
-                        await websocket.send_json({"type": "error", "msg": f"Cenový strop ({val}) nemůže být nižší než cenová podlaha ({game.price_floor})!"})
+                        await send_error(websocket, f"Cenový strop ({val}) nemůže být nižší než cenová podlaha ({game.price_floor})!")
                         continue
                     game.price_ceiling = val
-                    await broadcast_room(room_id, {"type": "shock", "msg": f"🔔 Cenový strop: {val} Kč!"})
+                await broadcast_room(room_id, {"type": "shock", "msg": f"🔔 Cenový strop: {val} Kč!"})
                 await broadcast_state(room_id)
-            elif data["action"] == "reset":
-                game.reset()
+            elif action == "remove_ceiling":
+                async with game.lock:
+                    game.price_ceiling = 999
+                await broadcast_room(room_id, {"type": "shock", "msg": "🔔 Cenový strop zrušen!"})
+                await broadcast_state(room_id)
+            elif action == "reset":
+                async with game.lock:
+                    game.reset()
                 await broadcast_room(room_id, {"type": "reset"})
                 await broadcast_state(room_id)
+            else:
+                await send_error(websocket, f"Neznámá akce: {action}")
     except WebSocketDisconnect:
+        logger.info(f"Admin disconnected from room {room_id}")
         if websocket in room_admin_connections.get(room_id, []):
             room_admin_connections[room_id].remove(websocket)
 
@@ -597,7 +677,8 @@ canvas{width:100%;max-height:300px}
 <h2>💥 Tržní šoky</h2>
 <div class="shock-group"><label>Daň (Kč/ks):</label><input id="tax-val" type="number" value="0" min="0"><button class="btn btn-blue" onclick="send('set_tax',document.getElementById('tax-val').value)">Nastavit</button></div>
 <div class="shock-group"><label>Cenová podlaha:</label><input id="floor-val" type="number" value="0" min="0"><button class="btn btn-blue" onclick="send('set_floor',document.getElementById('floor-val').value)">Nastavit</button></div>
-<div class="shock-group"><label>Cenový strop:</label><input id="ceil-val" type="number" value="0" min="0"><button class="btn btn-blue" onclick="send('set_ceiling',document.getElementById('ceil-val').value)">Nastavit</button></div>
+<div class="shock-group"><label>Cenový strop:</label><input id="ceil-val" type="number" value="0" min="0"><button class="btn btn-blue" onclick="send('set_ceiling',document.getElementById('ceil-val').value)">Nastavit</button>
+<button class="btn btn-blue" onclick="send('remove_ceiling')">Zrušit strop</button></div>
 </div>
 
 <div class="card">
