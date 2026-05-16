@@ -411,7 +411,7 @@ input.name-input{letter-spacing:normal;font-size:1em}
 .examples{text-align:center;color:#64748b;font-size:0.8em;margin-top:4px}
 </style></head><body>
 <div class="container">
-<h1>👋 Čau, Tržní Aréna</h1>
+<h1>📊 Tržní Aréna</h1>
 <p class="subtitle">Mikroekonomie 1 – Simulace trhu</p>
 
 <div class="card">
@@ -484,7 +484,7 @@ input:focus{outline:none;border-color:#3b82f6}
 .shock-banner{background:linear-gradient(135deg,#b45309,#92400e);padding:10px;border-radius:12px;text-align:center;margin-bottom:12px;font-weight:bold;color:#fcd34d}
 </style></head><body>
 <div class="container">
-<h1>👋 Čau, Tržní Aréna</h1>
+<h1>📊 Tržní Aréna</h1>
 <div class="room-badge">Seminář: __ROOM_ID__</div>
 
 <div class="card" id="status-card">
@@ -649,7 +649,7 @@ canvas{width:100%;max-height:300px}
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head><body>
 <div class="container">
-<h1>👋 Čau, Tržní Aréna – Lektor</h1>
+<h1>📊 Tržní Aréna – Lektor</h1>
 <div class="room-badge">Seminář: __ROOM_ID__</div>
 
 <div class="card">
