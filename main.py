@@ -1,5 +1,6 @@
 
 import asyncio
+import html
 import json
 import random
 import os
@@ -9,6 +10,24 @@ from typing import Dict, List
 import uvicorn
 
 app = FastAPI(title="Tržní Aréna v2 - Multi-room")
+
+# ============ INPUT SANITIZATION & VALIDATION ============
+MAX_PLAYER_NAME_LENGTH = 30
+MAX_ROOM_ID_LENGTH = 20
+
+def sanitize_name(name: str) -> str:
+    """Sanitize player name to prevent XSS and enforce length limits."""
+    if not name:
+        return "Anonym"
+    sanitized = html.escape(name.strip())
+    return sanitized[:MAX_PLAYER_NAME_LENGTH]
+
+def validate_room_id(room_id: str) -> bool:
+    """Validate room ID format."""
+    if not room_id or len(room_id) > MAX_ROOM_ID_LENGTH:
+        return False
+    allowed_chars = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.")
+    return all(c in allowed_chars for c in room_id)
 
 # ============ GAME STATE PER ROOM ============
 class GameState:
@@ -47,16 +66,16 @@ class GameState:
         return player
 
     def _calc_equilibrium(self):
+        self.equilibrium_price = 0
+        self.equilibrium_qty = 0
         buyers = sorted([p["wtp"] for p in self.players.values() if p["role"] == "buyer"], reverse=True)
         sellers = sorted([p["mc"] for p in self.players.values() if p["role"] == "seller"])
-        qty = 0
         for i in range(min(len(buyers), len(sellers))):
             if buyers[i] >= sellers[i] + self.tax:
-                qty = i + 1
+                self.equilibrium_qty = i + 1
                 self.equilibrium_price = (buyers[i] + sellers[i] + self.tax) / 2
             else:
                 break
-        self.equilibrium_qty = qty
 
     def start_round(self):
         self.round += 1
@@ -74,8 +93,14 @@ class GameState:
         for bid in self.bids:
             if bid["matched"]:
                 continue
+            buyer = self.players.get(bid["player"])
+            if buyer is None or buyer.get("traded_this_round"):
+                continue
             for offer in self.offers:
                 if offer["matched"]:
+                    continue
+                seller = self.players.get(offer["player"])
+                if seller is None or seller.get("traded_this_round"):
                     continue
                 effective_price = offer["price"] + self.tax
                 if bid["price"] >= effective_price and offer["price"] >= self.price_floor and bid["price"] <= self.price_ceiling:
@@ -174,8 +199,21 @@ async def admin_page(room_id: str):
 @app.websocket("/ws/player/{room_id}/{name}")
 async def player_ws(websocket: WebSocket, room_id: str, name: str):
     await websocket.accept()
+    # Validate room_id
+    if not validate_room_id(room_id):
+        await websocket.send_json({"type": "error", "msg": "Neplatný kód semináře!"})
+        await websocket.close()
+        return
+    # Sanitize player name
+    name = sanitize_name(name)
     game = get_room(room_id)
     player = game.add_player(name)
+    # Close old connection if same player name reconnects
+    if name in room_connections.get(room_id, {}):
+        try:
+            await room_connections[room_id][name].close()
+        except:
+            pass
     room_connections[room_id][name] = websocket
     await websocket.send_json({"type": "welcome", "player": player, "room": room_id})
     await broadcast_state(room_id)
@@ -188,15 +226,22 @@ async def player_ws(websocket: WebSocket, room_id: str, name: str):
                     await websocket.send_json({"type": "error", "msg": "Už jsi v tomto kole obchodoval/a!"})
                     continue
                 price = float(data["price"])
+                if price <= 0:
+                    await websocket.send_json({"type": "error", "msg": "Cena musí být kladná!"})
+                    continue
                 if p["role"] == "buyer":
                     if price > p["wtp"]:
                         await websocket.send_json({"type": "error", "msg": f"Nemůžeš nabídnout víc než tvá WTP ({p['wtp']})!"})
                         continue
+                    # Replace any previous unmatched bid from this player
+                    game.bids = [b for b in game.bids if b["player"] != name]
                     game.bids.append({"player": name, "price": price, "matched": False})
                 else:
                     if price < p["mc"]:
                         await websocket.send_json({"type": "error", "msg": f"Nemůžeš prodávat pod svými MC ({p['mc']})!"})
                         continue
+                    # Replace any previous unmatched offer from this player
+                    game.offers = [o for o in game.offers if o["player"] != name]
                     game.offers.append({"player": name, "price": price, "matched": False})
                 matched = game.try_match()
                 if matched:
@@ -209,6 +254,11 @@ async def player_ws(websocket: WebSocket, room_id: str, name: str):
 @app.websocket("/ws/admin/{room_id}")
 async def admin_ws(websocket: WebSocket, room_id: str):
     await websocket.accept()
+    # Validate room_id
+    if not validate_room_id(room_id):
+        await websocket.send_json({"type": "error", "msg": "Neplatný kód semináře!"})
+        await websocket.close()
+        return
     game = get_room(room_id)
     room_admin_connections.setdefault(room_id, []).append(websocket)
     await broadcast_state(room_id)
@@ -229,13 +279,26 @@ async def admin_ws(websocket: WebSocket, room_id: str):
                 await broadcast_room(room_id, {"type": "shock", "msg": f"🔔 Nová daň: {game.tax} Kč na jednotku!"})
                 await broadcast_state(room_id)
             elif data["action"] == "set_floor":
-                game.price_floor = float(data["value"])
+                val = float(data["value"])
+                if val < 0:
+                    continue
+                if game.price_ceiling < 999 and val > game.price_ceiling:
+                    await websocket.send_json({"type": "error", "msg": f"Cenová podlaha ({val}) nemůže být vyšší než cenový strop ({game.price_ceiling})!"})
+                    continue
+                game.price_floor = val
                 await broadcast_room(room_id, {"type": "shock", "msg": f"🔔 Cenová podlaha: {game.price_floor} Kč!"})
                 await broadcast_state(room_id)
             elif data["action"] == "set_ceiling":
                 val = float(data["value"])
-                game.price_ceiling = val if val > 0 else 999
-                await broadcast_room(room_id, {"type": "shock", "msg": f"🔔 Cenový strop: {val} Kč!" if val > 0 else "🔔 Cenový strop zrušen!"})
+                if val <= 0:
+                    game.price_ceiling = 999
+                    await broadcast_room(room_id, {"type": "shock", "msg": "🔔 Cenový strop zrušen!"})
+                else:
+                    if game.price_floor > 0 and val < game.price_floor:
+                        await websocket.send_json({"type": "error", "msg": f"Cenový strop ({val}) nemůže být nižší než cenová podlaha ({game.price_floor})!"})
+                        continue
+                    game.price_ceiling = val
+                    await broadcast_room(room_id, {"type": "shock", "msg": f"🔔 Cenový strop: {val} Kč!"})
                 await broadcast_state(room_id)
             elif data["action"] == "reset":
                 game.reset()
