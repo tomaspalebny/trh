@@ -1,0 +1,37 @@
+{
+  "repo": "trh",
+  "remote": "https://github.com/tomaspalebny/trh.git",
+  "last_commit": {
+    "hash": "21a6ebfef8f23b4db278589b039b1221d504a7e8",
+    "date": "2026-03-28 16:20:59 +0100",
+    "message": "Create doc.md"
+  },
+  "structure": {
+    "total_files": 6,
+    "total_size_kb": 46.1,
+    "extensions": {
+      ".md": 3,
+      ".py": 1,
+      ".yaml": 1,
+      ".txt": 1
+    },
+    "structure_hash": "b053ddd46c14"
+  },
+  "tracking": {
+    "last_checked": "2026-05-06T09:07:53.333981",
+    "check_count": 1,
+    "changes_detected": []
+  },
+  "summary": {
+    "purpose": "Real-time double auction simulace – studenti jako kupující a prodávající zadávají cenové nabídky, systém je automaticky páruje. Demonstruje nabídku/poptávku, konvergenci k rovnováze, daňovou incidenci, cenové stropy/podlahy.",
+    "key_files": {
+      "main.py": "FastAPI server – double auction matching, výpočet rovnovážné ceny, tržní šoky",
+      "doc.md": "Nejdetailnější dokumentace (257 ř.) – architektura, matching, WebSocket protokol, 5 kol",
+      "README.md": "Deploy návod na Render.com",
+      "PROJECT_STRUCTURE.md": "Přehled algoritmů, tržních šoků a datových toků"
+    },
+    "tech_stack": "FastAPI, WebSocket, uvicorn, Chart.js, Render.com",
+    "status": "Produkčně nasazeno. Nejpropracovanější dokumentace. 5 kol, paralelní semináře.",
+    "last_summarized": "2026-05-06T09:07:53.333981"
+  }
+}
